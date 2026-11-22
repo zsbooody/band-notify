@@ -1,0 +1,13 @@
+[Unit]
+Description=band-notify ntfy push server (LAN)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+UMask=0077
+ExecStart=%h/.local/bin/ntfy serve --config %h/.config/band-notify/ntfy-server.yml
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

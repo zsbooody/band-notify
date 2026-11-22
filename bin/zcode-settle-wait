@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""zcode-settle-wait —— ZCode「一切任务真的结束」等待器（由 zcode-notify-gate 挂起）。
+
+当 Stop 钩子触发时 ZCode 还有在飞的工作（未收尾的 turn、工作流节点、后台 Bash、
+后台子 agent），本次不提醒；由本进程持续观察 ZCode 的运行时日志，等整个 runtime
+安静下来后，只推一条「zcode 停工等你」。
+
+安静的定义：**没有在飞的工作单元**（判定见 lib/zcode-notify/logstate.py：
+未收尾的 turn / 后台任务 / 工具调用），且最近 quietSeconds 秒内没有任何“工作类”事件
+（模型请求、工具调用、turn、后台任务、工作流、压缩等）。
+
+⚠️ 「没有新日志行」本身**不是**结束的证据：GLM 单次模型请求实测要 15~304 秒不写一行日志。
+   所以必须两者同时成立，只按静默时长判会把“慢请求在途”误报成“任务结束”。
+
+环境变量（兼容旧名）：
+  ZCODE_NOTIFY_QUIET_SECONDS  安静判定窗口，默认取配置 quietSeconds（15）
+  ZCODE_NOTIFY_MAX_WAIT       最长等待秒数，默认取配置 maxWait（5400）
+  ZCODE_NOTIFY_COOLDOWN       两条提醒之间的最小间隔，默认取配置 cooldownSeconds（60）
+  ZCODE_NOTIFY_LOG_DIR        换日志目录（自测用）
+  ZCODE_NOTIFY_DRY_RUN=1      只记日志、不推送（自测用）
+"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+BASE = pathlib.Path(__file__).resolve().parent.parent
+LIB = BASE / "lib"
+ZCODE_LIB = LIB / "zcode-notify"
+sys.path.insert(0, str(LIB))
+sys.path.insert(0, str(ZCODE_LIB))
+
+import config as bnconfig  # noqa: E402
+
+CFG = bnconfig.load()
+LOG_DIR = pathlib.Path(os.environ.get("ZCODE_NOTIFY_LOG_DIR") or CFG["zcodeLogDir"])
+STATE = pathlib.Path(CFG["stateDir"])
+STATE.mkdir(parents=True, exist_ok=True)
+WAIT_LOG = STATE / "zcode-settle.log"
+COOLDOWN_FILE = STATE / "zcode-last-push"
+AI_NOTIFY = BASE / "bin" / "band-notify-hook"
+ZCODE_PROCESS = str(CFG.get("zcodeProcess") or "/opt/ZCode/zcode")
+
+QUIET = float(os.environ.get("ZCODE_NOTIFY_QUIET_SECONDS", CFG.get("quietSeconds", 15)))
+MAX_WAIT = float(os.environ.get("ZCODE_NOTIFY_MAX_WAIT", CFG.get("maxWait", 5400)))
+COOLDOWN = float(os.environ.get("ZCODE_NOTIFY_COOLDOWN", CFG.get("cooldownSeconds", 60)))
+POLL = 3.0
+
+
+def log(msg, **kw):
+    line = {"ts": datetime.now().astimezone().strftime("%F %T"), "msg": msg}
+    line.update(kw)
+    try:
+        with open(WAIT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def zcode_alive():
+    # 自测/复盘（DRY_RUN）不要求 ZCode 正在运行。
+    if os.environ.get("ZCODE_NOTIFY_DRY_RUN") == "1":
+        return True
+    try:
+        return subprocess.run(["pgrep", "-f", ZCODE_PROCESS],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        return True
+
+
+def push(payload):
+    if os.environ.get("ZCODE_NOTIFY_DRY_RUN") == "1":
+        log("push(skipped: dry-run)")
+        return
+    if not AI_NOTIFY.exists():
+        log("push failed: 缺少 band-notify-hook", path=str(AI_NOTIFY))
+        return
+    try:
+        with open(COOLDOWN_FILE) as f:
+            last = float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        last = 0.0
+    if time.time() - last < COOLDOWN:
+        log("push(skipped: cooldown)")
+        return
+    proc = subprocess.run([str(AI_NOTIFY), "zcode", "Stop"],
+                          input=json.dumps(payload, ensure_ascii=False).encode(),
+                          timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          env={**os.environ, "BAND_NOTIFY_HOOK_STRICT": "1"})
+    if proc.returncode != 0:
+        log("push failed", rc=proc.returncode)
+        return
+    try:
+        COOLDOWN_FILE.write_text(str(time.time()))
+    except OSError:
+        pass
+    log("pushed", rc=proc.returncode)
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        payload = {}
+    sid = str(payload.get("session_id") or "")
+    deadline = time.time() + MAX_WAIT
+    try:
+        import logstate  # noqa: E402
+    except Exception as exc:
+        # 缺共用模块就没法判定“真的结束”——不推，让闸门那边（它会回退到裸钩子）去震。
+        log("error: logstate 不可用，直接退出", err=repr(exc)[:160], sid=sid[:20])
+        return
+    state = logstate.LogState(LOG_DIR)
+    last_note = 0.0
+    while time.time() < deadline:
+        units, last_work = state.poll()
+        quiet_for = time.time() - last_work
+        if not units and quiet_for >= QUIET:
+            if not zcode_alive():
+                log("exit: zcode 不在运行了", sid=sid[:20])
+                return
+            log("settled", quiet_for=round(quiet_for, 1), sid=sid[:20])
+            push(payload)
+            return
+        # 每 5 分钟记一次“还在等什么”，方便事后复盘。
+        if time.time() - last_note > 300:
+            last_note = time.time()
+            log("waiting", n=len(units), sample=list(units)[:3],
+                quiet_for=round(quiet_for, 1), sid=sid[:20])
+        time.sleep(POLL)
+    log("exit: 超过最长等待", sid=sid[:20])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:  # 永不打扰调用方
+        log("error", err=repr(exc)[:200])
+    sys.exit(0)

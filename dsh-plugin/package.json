@@ -1,0 +1,24 @@
+{
+  "name": "dsh-band-notify",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "DSH 宿主插件：回合结束 / 等确认 / 等回答 / 出错时推 ntfy，手机转发到手环振动",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

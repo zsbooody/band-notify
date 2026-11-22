@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# 手动/脚本推送一条通知到手环：
+#   band-notify "标题" "正文" [优先级 1-5]
+# 例：band-notify "构建完成" "make -j8 退出码 0" 5
+set -uo pipefail
+
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+# shellcheck source=../lib/config.sh
+. "$SCRIPT_DIR/../lib/config.sh"
+
+# DSH 桌面版会把自带 python 的 PYTHONHOME/PYTHONPATH 泄漏给子进程；
+# 不清掉的话系统 python3 会起不来，JSON 转义会静默失败。
+unset PYTHONHOME PYTHONPATH 2>/dev/null || true
+
+band_notify_require_topic || exit 1
+
+TITLE="${1:-band-notify}"
+BODY="${2:-（无正文）}"
+PRIO="${3:-4}"
+case "$PRIO" in
+  1|2|3|4|5) ;;
+  *) printf '优先级必须是 1-5（收到 %s）\n' "$PRIO" >&2; exit 2 ;;
+esac
+
+json_escape() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -Rs .
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+  else
+    printf '需要 jq 或 python3 之一来生成 JSON\n' >&2
+    return 1
+  fi
+}
+
+TITLE_JSON=$(printf '%s' "$TITLE" | json_escape) || exit 1
+BODY_JSON=$(printf '%s' "$BODY" | json_escape) || exit 1
+PAYLOAD=$(printf '{"topic":"%s","title":%s,"message":%s,"priority":%s,"tags":["bell"]}' \
+  "$BAND_NOTIFY_TOPIC" "$TITLE_JSON" "$BODY_JSON" "$PRIO")
+
+HTTP=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$BAND_NOTIFY_SERVER" \
+  -H 'Content-Type: application/json' --data-binary "$PAYLOAD" 2>/dev/null || printf '000')
+
+if [ "$HTTP" != "200" ]; then
+  printf '发送失败：HTTP %s（服务 %s，topic %s…）\n' "$HTTP" "$BAND_NOTIFY_SERVER" "${BAND_NOTIFY_TOPIC:0:4}" >&2
+  exit 1
+fi
+printf 'sent -> %s…\n' "${BAND_NOTIFY_TOPIC:0:4}"

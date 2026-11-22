@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# band-notify-hook —— 通用「AI 停工/需确认 → 手环振动」钩子
+#
+# 用法（放在各 harness 的 hooks 配置里）：
+#   band-notify-hook <harness名> [兜底事件名]
+#
+# 约定：
+#   · 从 stdin 读钩子 JSON（grok / kimi / zcode 都这么传），也兼容环境变量兜底
+#   · 默认永不写 stdout（避免污染 harness 的钩子协议）、永远 exit 0；
+#     BAND_NOTIFY_HOOK_STRICT=1 时发送失败返回 1（供内部闸门/等待器判断）
+#   · 失败只写日志，不影响 harness
+set -uo pipefail
+umask 077
+
+# DSH 桌面版会把自带的 PYTHONHOME/PYTHONPATH 泄漏给子进程，导致系统 python3 起不来。
+unset PYTHONHOME PYTHONPATH 2>/dev/null || true
+
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+# shellcheck source=../lib/config.sh
+. "$SCRIPT_DIR/../lib/config.sh"
+
+HARNESS="${1:-ai}"
+FALLBACK_EVENT="${2:-Stop}"
+STRICT="${BAND_NOTIFY_HOOK_STRICT:-0}"
+STATE_DIR="${BAND_NOTIFY_STATE_DIR}/hook"
+LOG="$STATE_DIR/band-notify-hook.log"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+log() {
+  printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG" 2>/dev/null || true
+  # 日志超过 512KB 就清空，避免长期运行无限增长。
+  if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || printf 0)" -gt 524288 ]; then
+    : >"$LOG" 2>/dev/null || true
+  fi
+}
+
+if [ -z "${BAND_NOTIFY_TOPIC:-}" ]; then
+  log "skip: BAND_NOTIFY_TOPIC 未配置（先跑 install.sh）"
+  [ "$STRICT" = "1" ] && exit 1
+  exit 0
+fi
+
+INPUT="$(cat 2>/dev/null || true)"
+
+# 事件名/项目名从常见的 hook JSON 字段里提取；jq 优先，python3 兜底。
+json_get() {
+  local expr="$1"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$INPUT" | jq -r "$expr // empty" 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    INPUT="$INPUT" python3 - "$expr" <<'PY' 2>/dev/null
+import json, os, sys
+expr = sys.argv[1]
+raw = os.environ.get("INPUT", "").strip()
+d = {}
+if raw:
+    try:
+        d = json.loads(raw)
+    except Exception:
+        d = {}
+path = expr.lstrip(".")
+value = d
+for part in path.split("."):
+    if isinstance(value, dict):
+        value = value.get(part)
+    else:
+        value = None
+        break
+if value is None:
+    print("")
+elif isinstance(value, (dict, list)):
+    print(json.dumps(value, ensure_ascii=False))
+else:
+    print(value)
+PY
+  fi
+}
+
+EV=$(json_get ".hook_event_name")
+[ -n "$EV" ] || EV=$(json_get ".hookEventName")
+[ -n "$EV" ] || EV=$(json_get ".event")
+[ -n "$EV" ] || EV="${GROK_HOOK_EVENT:-$FALLBACK_EVENT}"
+
+CWD=$(json_get ".cwd")
+[ -n "$CWD" ] || CWD=$(json_get ".workspace_root")
+[ -n "$CWD" ] || CWD="${CLAUDE_PROJECT_DIR:-$PWD}"
+PROJ=$(basename "${CWD%/}" 2>/dev/null || printf '%s' "ai")
+[ -n "$PROJ" ] || PROJ="ai"
+if [ "${BAND_NOTIFY_INCLUDE_PROJECT:-1}" = "0" ]; then
+  PROJ_LABEL=""
+else
+  PROJ_LABEL="${PROJ} · "
+fi
+
+NTYPE=$(json_get ".notification_type")
+[ -n "$NTYPE" ] || NTYPE=$(json_get ".matcher")
+KIND=$(printf '%s' "$EV" | tr '[:upper:]' '[:lower:]')
+
+case "$KIND" in
+  *permission*)
+    TITLE="${HARNESS} 需要你确认"; MSG="${PROJ_LABEL}等你点允许/确认"; PRIO=5; TAG="warning" ;;
+  *stopfailure*|*error*)
+    TITLE="${HARNESS} 因错误停止"; MSG="${PROJ_LABEL}出错中断了，来看一眼"; PRIO=5; TAG="rotating_light" ;;
+  stop|turnended|turn_ended|task_complete|idle_prompt|notification|"")
+    TITLE="${HARNESS} 停工等你"; MSG="${PROJ_LABEL}任务结束，等你回来看结果"; PRIO=5; TAG="robot" ;;
+  *)
+    TITLE="${HARNESS} 需要你注意"; MSG="${PROJ_LABEL}${EV}"; PRIO=4; TAG="bell" ;;
+esac
+
+if [ "${NTYPE:-}" = "permission_prompt" ]; then
+  TITLE="${HARNESS} 需要你确认"; MSG="${PROJ_LABEL}等你点允许/确认"; PRIO=5; TAG="warning"
+fi
+
+# 生成 payload：jq 优先，python3 兜底；两者都缺失就只记日志。
+if command -v jq >/dev/null 2>&1; then
+  PAYLOAD=$(jq -nc --arg topic "$BAND_NOTIFY_TOPIC" --arg title "$TITLE" --arg message "$MSG" \
+    --argjson priority "$PRIO" --arg tag "$TAG" \
+    '{topic:$topic,title:$title,message:$message,priority:$priority,tags:[$tag]}' 2>/dev/null || true)
+elif command -v python3 >/dev/null 2>&1; then
+  PAYLOAD=$(TOPIC="$BAND_NOTIFY_TOPIC" TITLE="$TITLE" MSG="$MSG" PRIO="$PRIO" TAG="$TAG" python3 - <<'PY' 2>/dev/null
+import json, os
+print(json.dumps({
+    "topic": os.environ.get("TOPIC", ""),
+    "title": os.environ.get("TITLE", ""),
+    "message": os.environ.get("MSG", ""),
+    "priority": int(os.environ.get("PRIO", "4")),
+    "tags": [os.environ.get("TAG", "bell")],
+}, ensure_ascii=False))
+PY
+)
+else
+  log "skip: 需要 jq 或 python3 生成 JSON（harness=$HARNESS event=$FALLBACK_EVENT）"
+  [ "$STRICT" = "1" ] && exit 1
+  exit 0
+fi
+
+if [ -z "${PAYLOAD:-}" ]; then
+  log "skip: 空 payload（harness=$HARNESS event=$FALLBACK_EVENT）"
+  [ "$STRICT" = "1" ] && exit 1
+  exit 0
+fi
+
+# 去重：同一 harness + 消息 20 秒内只提醒一次。
+# 用文件锁把“读时间-比较-写时间”变成原子操作，避免 Stop 与 Notification 并发双震。
+HASH=$(printf '%s' "$PAYLOAD" | sha256sum 2>/dev/null | cut -c1-8 || true)
+KEY="${HARNESS}_${HASH:-$$}"
+NOW=$(date +%s)
+LOCK_DIR="$STATE_DIR/locks"
+mkdir -p "$LOCK_DIR" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK_DIR/$KEY.lock" 2>/dev/null || exit 0
+  flock -n 9 || exit 0
+  LAST=$(cat "$STATE_DIR/$KEY" 2>/dev/null || printf 0)
+  [ $((NOW - LAST)) -lt 20 ] && exit 0
+else
+  LOCK="$LOCK_DIR/$KEY.lockdir"
+  mkdir "$LOCK" 2>/dev/null || exit 0
+  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+  LAST=$(cat "$STATE_DIR/$KEY" 2>/dev/null || printf 0)
+  [ $((NOW - LAST)) -lt 20 ] && exit 0
+fi
+
+HTTP=$(curl -sS -m 2 -o /dev/null -w '%{http_code}' -X POST "$BAND_NOTIFY_SERVER" \
+  -H 'Content-Type: application/json' --data-binary "$PAYLOAD" 2>/dev/null || printf '000')
+if [ "$HTTP" = "200" ]; then
+  # 只在发送成功后记时间，失败时下一次事件可以立刻重试。
+  printf '%s' "$NOW" >"$STATE_DIR/$KEY" 2>/dev/null || true
+else
+  log "send failed http=$HTTP harness=$HARNESS event=$FALLBACK_EVENT"
+  [ "$STRICT" = "1" ] && exit 1
+fi
+exit 0

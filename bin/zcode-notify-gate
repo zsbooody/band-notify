@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""zcode-notify-gate —— ZCode 的 Stop 钩子闸门。
+
+ZCode 的 Stop 钩子不等于「一切任务结束」：工作流/后台派遣时，子会话与工作流节点
+每结束一步、以及主会话「已派发」就结束本轮，都会触发 Stop（会连震很多次）。
+本闸门只放行「一切任务真的结束」的那一次：
+
+  Stop 事件
+    ├─ 扫 ZCode 运行时日志，看在飞的工作单元（未收尾的 turn / 后台任务 / 工具调用，
+    │  判定逻辑见 lib/zcode-notify/logstate.py）
+    │    └─ 有在飞 → 交给 zcode-settle-wait 挂起等待，本次不推
+    └─ 没有在飞 → 等 firstDelay 秒复核（挡“刚结束的后台任务马上把主会话续跑”这种竞态）
+         ├─ 复核时出现在飞 → 交给等待器
+         ├─ 本会话在这几秒里又动了（说明它续跑了，稍后还会有一次 Stop）→ 直接退
+         └─ 都没有 → 推「zcode 停工等你」
+
+配置来自 ~/.config/band-notify/config.json 与环境变量，见 lib/config.py。
+环境变量（兼容旧名）：
+  ZCODE_NOTIFY_FIRST_DELAY   快路径复核延迟秒数，默认取配置 firstDelay（5）
+  ZCODE_NOTIFY_LOG_DIR       换日志目录（自测用）
+  ZCODE_NOTIFY_GATE_DISABLE=1  停用闸门（等价于原来的裸钩子）
+  ZCODE_NOTIFY_DRY_RUN=1     只记日志、不推送（自测用）
+"""
+import fcntl
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+BASE = pathlib.Path(__file__).resolve().parent.parent
+LIB = BASE / "lib"
+ZCODE_LIB = LIB / "zcode-notify"
+sys.path.insert(0, str(LIB))
+sys.path.insert(0, str(ZCODE_LIB))
+
+import config as bnconfig  # noqa: E402
+
+CFG = bnconfig.load()
+LOG_DIR = pathlib.Path(os.environ.get("ZCODE_NOTIFY_LOG_DIR") or CFG["zcodeLogDir"])
+STATE = pathlib.Path(CFG["stateDir"])
+STATE.mkdir(parents=True, exist_ok=True)
+GATE_LOG = STATE / "zcode-gate.log"
+LOCK_FILE = STATE / "zcode-settle.lock"
+COOLDOWN_FILE = STATE / "zcode-last-push"
+WAITER = BASE / "bin" / "zcode-settle-wait"
+AI_NOTIFY = BASE / "bin" / "band-notify-hook"
+FIRST_DELAY = float(os.environ.get("ZCODE_NOTIFY_FIRST_DELAY", CFG.get("firstDelay", 5)))
+ZCODE_PROCESS = str(CFG.get("zcodeProcess") or "/opt/ZCode/zcode")
+
+
+def log(msg, **kw):
+    line = {"ts": datetime.now().astimezone().strftime("%F %T"), "msg": msg}
+    line.update(kw)
+    try:
+        with open(GATE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _load_logstate():
+    """加载共用的“在飞单元”判定模块。
+
+    万一部署时漏了这个文件，退回裸钩子行为：宁可多震几次，也不要静默到一次都不提醒。
+    """
+    try:
+        import logstate as mod  # noqa: E402
+        return mod
+    except Exception as exc:
+        log("error: logstate 不可用，本轮回退裸钩子", err=repr(exc)[:160])
+        return None
+
+
+logstate = _load_logstate()
+
+
+def inflight(exclude_sessions):
+    """扫一遍日志，返回在飞单元。"""
+    state = logstate.LogState(LOG_DIR)
+    units, _ = state.poll()
+    return state.units(exclude_turn_sessions=exclude_sessions)
+
+
+def snapshots():
+    """各日志文件的当前大小，用来判断“这个会话后又动了没”。"""
+    out = []
+    for path in logstate.log_files(LOG_DIR):
+        try:
+            out.append((path, path.stat().st_size))
+        except OSError:
+            pass
+    return out
+
+
+def session_moved(sid, snaps):
+    """自快照之后，该会话有没有**又开始干活**（只看“起头”事件）。
+
+    turn 结束后 runtime 还会再落几行收尾日志（turn.phase.completed、
+    model.request.completed…），拿它们当“续跑”会把真提醒也跳掉。
+    """
+    if not sid:
+        return False
+    for path, size in snaps:
+        try:
+            with open(path, "rb") as f:
+                f.seek(size)
+                new = f.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        for ln in new:
+            if not ln.strip():
+                continue
+            try:
+                d = json.loads(ln)
+            except ValueError:
+                continue
+            if d.get("sessionId") == sid and logstate.is_resume_event(d.get("event") or ""):
+                return True
+    return False
+
+
+def spawn_waiter(payload):
+    """挂一个 detach 的等待器；已有等待器在跑就不重复挂。"""
+    if not WAITER.exists():
+        log("waiter missing", path=str(WAITER))
+        return False
+    try:
+        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock_fd)
+        return False  # 已有等待器持有锁
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(WAITER)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, pass_fds=(lock_fd,),
+        )
+        proc.stdin.write(json.dumps(payload, ensure_ascii=False).encode())
+        proc.stdin.close()  # 写完就放手，不等它（它要等 ZCode 静下来才退出）
+    except OSError as exc:
+        log("waiter spawn failed", err=repr(exc)[:120])
+        os.close(lock_fd)
+        return False
+    return True
+
+
+def push(payload, raw):
+    if os.environ.get("ZCODE_NOTIFY_DRY_RUN") == "1":
+        log("push(skipped: dry-run)")
+        return
+    if not AI_NOTIFY.exists():
+        log("push failed: 缺少 band-notify-hook", path=str(AI_NOTIFY))
+        return
+    proc = subprocess.run([str(AI_NOTIFY), "zcode", "Stop"], input=raw.encode(),
+                          timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          env={**os.environ, "BAND_NOTIFY_HOOK_STRICT": "1"})
+    if proc.returncode != 0:
+        log("push failed", rc=proc.returncode)
+        return
+    # 记一笔冷却时间，让等待器知道“刚刚已经震过了”，避免两条通道各推一次
+    try:
+        COOLDOWN_FILE.write_text(str(time.time()))
+    except OSError:
+        pass
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        payload = {}
+    sid = str(payload.get("session_id") or "")
+    agent = str(payload.get("agent_type") or "")
+    # 先记一笔“钩子真的跑到了”。async 钩子有可能被宿主提前杀掉（无头 CLI 收尾时就这样），
+    # 只有这根线能区分“没触发 Stop”和“触发了但被杀/报错”。
+    log("seen", sid=sid[:20], agent=agent, ev=payload.get("hook_event_name") or "",
+        cwd=str(payload.get("cwd") or "")[:40])
+    # Stop 本身说明“这个会话停了”，它的 turn 不再用来否决本次提醒
+    # （也顺带免疫“turn.completed 还没落盘，钩子先到了”这种时序差）
+    exclude = {sid} if sid else set()
+
+    if logstate is None:  # 共用模块缺失：退回裸钩子
+        push(payload, raw)
+        return
+
+    units = inflight(exclude)
+    if units:
+        ok = spawn_waiter(payload)
+        log("defer(inflight)", n=len(units), sample=list(units)[:2], sid=sid[:20], agent=agent, waiter=ok)
+        return
+
+    snaps = snapshots()
+    time.sleep(FIRST_DELAY)
+
+    units = inflight(exclude)
+    if units:
+        ok = spawn_waiter(payload)
+        log("defer(race)", n=len(units), sample=list(units)[:2], sid=sid[:20], agent=agent, waiter=ok)
+        return
+    if session_moved(sid, snaps):
+        log("skip(session resumed)", sid=sid[:20], agent=agent)
+        return
+
+    log("push", sid=sid[:20], agent=agent)
+    push(payload, raw)
+
+
+if __name__ == "__main__":
+    if os.environ.get("ZCODE_NOTIFY_GATE_DISABLE") == "1":
+        # 明确要求停用闸门：退回裸钩子行为（直接推一条），而不是把提醒整个关掉。
+        try:
+            raw = sys.stdin.read()
+            try:
+                payload = json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                payload = {}
+            push(payload, raw)
+        except Exception as exc:
+            log("error", err=repr(exc)[:200])
+        sys.exit(0)
+    try:
+        main()
+    except Exception as exc:
+        log("error", err=repr(exc)[:200])
+    sys.exit(0)

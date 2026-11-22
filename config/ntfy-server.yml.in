@@ -1,0 +1,12 @@
+# band-notify 的 ntfy 配置模板。
+# install.sh 会把 __PORT__ / __CACHE_FILE__ / __AUTH_FILE__ 替换成本机实际路径。
+listen-http: ":__PORT__"
+# base-url 不写死：由请求的 Host 头自动探测，避免换网段后失效。
+cache-file: "__CACHE_FILE__"
+cache-duration: "12h"
+enable-metrics: true
+
+# 安全：默认匿名读写，靠 topic 名保密。
+# 在公司 / 咖啡厅 / 宿舍等共享局域网，建议开启认证（见 docs/security.md）：
+# auth-file: "__AUTH_FILE__"
+# auth-default-access: "deny-all"
